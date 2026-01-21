@@ -13,17 +13,12 @@ import shutil
 
 # ===================== CONFIG ===================== #
 EVENTS = {
-    "Disfruta": "https://www.dinaticket.com/es/provider/10402/event/4905281",
-    "Miedo": "https://www.dinaticket.com/es/provider/10402/event/4915778",
-    "Escondido": "https://www.dinaticket.com/es/provider/20073/event/4930233",
+    "Escondido": "https://www.dinaticket.com/es/provider/20073/event/4919204",
+    "Escalera": "https://www.dinaticket.com/es/provider/10402/event/4923185",
 }
 
-FEVER_URLS = {
-    "Miedo": "https://feverup.com/m/290561",
-    "Disfruta": "https://feverup.com/m/159767",
-}
 
-ABONO_URL = "https://compras.abonoteatro.com/?pagename=espectaculo&eventid=90857"
+ABONO_URL = "https://compras.abonoteatro.com/?pagename=espectaculo&eventid=23816"
 
 UA = {
     "User-Agent": (
