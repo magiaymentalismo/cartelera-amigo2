@@ -17,7 +17,10 @@ EVENTS = {
     "Escalera": "https://www.dinaticket.com/es/provider/10402/event/4923185",
 }
 
-
+FEVER_URLS = {
+    "Miedo": "https://feverup.com/m/290561",
+    "Disfruta": "https://feverup.com/m/159767",
+}
 ABONO_URL = "https://compras.abonoteatro.com/?pagename=espectaculo&eventid=23816"
 
 UA = {
