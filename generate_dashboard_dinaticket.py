@@ -15,6 +15,7 @@ import shutil
 EVENTS = {
     "Escondido": "https://www.dinaticket.com/es/provider/20073/event/4919204",
     "Escalera": "https://www.dinaticket.com/es/provider/10402/event/4923185",
+    "Oniria": "https://www.dinaticket.com/es/provider/20073/event/4940326",
 }
 
 FEVER_URLS = {
