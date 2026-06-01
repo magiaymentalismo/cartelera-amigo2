@@ -25,7 +25,7 @@ DINATICKET_EVENTS = {
 }
 
 ONEBOX_EVENTS = {
-    "Escalera": "https://entradas.laescaleradejacob.es/laescaleradejacob/select/2877829",
+    "Escalera": "https://entradas.laescaleradejacob.es/laescaleradejacob/events/56109",
 }
 
 FEVER_URLS = {
@@ -235,6 +235,7 @@ def parse_onebox_date(raw: str) -> tuple[str, str] | None:
 
     fecha_iso = f"{anio}-{mes_num}-{dia.zfill(2)}"
     hora = f"{int(hh):02d}:{mm}"
+
     return fecha_iso, hora
 
 
@@ -305,48 +306,20 @@ def count_onebox_stock_playwright(page) -> tuple[int | None, int | None]:
     return stock, capacidad
 
 
-def fetch_functions_onebox_requests(url: str, timeout: int = 20) -> list[dict]:
-    out: list[dict] = []
-    seen: set[tuple[str, str]] = set()
+def get_onebox_select_urls(page, parent_url: str) -> list[str]:
+    if "/select/" in parent_url:
+        return [parent_url]
 
-    r = requests.get(url, headers=UA, timeout=timeout)
-    r.raise_for_status()
+    hrefs = page.eval_on_selector_all(
+        "a[href]",
+        """els => els.map(a => a.href).filter(h => h.includes('/select/'))"""
+    )
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    text = soup.get_text(" ", strip=True)
-
-    date_texts = extract_onebox_dates_from_text(text)
-    print("DEBUG Onebox requests fechas:", date_texts)
-
-    for raw_date in date_texts:
-        parsed = parse_onebox_date(raw_date)
-        if not parsed:
-            continue
-
-        fecha_iso, hora = parsed
-        key = (fecha_iso, hora)
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-
-        fecha_dt = datetime.strptime(fecha_iso, "%Y-%m-%d")
-        fecha_label = fecha_dt.strftime("%d %b %Y")
-
-        out.append({
-            "fecha_label": fecha_label,
-            "fecha_iso": fecha_iso,
-            "hora": hora,
-            "vendidas_dt": None,
-            "capacidad": None,
-            "stock": None,
-        })
-
-    return sorted(out, key=lambda f: (f["fecha_iso"], f.get("hora") or "00:00"))
+    select_urls = sorted(set(hrefs))
+    return select_urls
 
 
-def fetch_functions_onebox_playwright(url: str, timeout: int = 45000) -> list[dict]:
+def fetch_functions_onebox(url: str) -> list[dict]:
     if sync_playwright is None:
         print("DEBUG Playwright no está instalado")
         return []
@@ -367,63 +340,105 @@ def fetch_functions_onebox_playwright(url: str, timeout: int = 45000) -> list[di
             timezone_id="Europe/Madrid",
         )
 
-        page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-        page.wait_for_timeout(5000)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(5000)
+        except Exception as e:
+            print(f"ERROR Onebox página padre: {e}")
+            browser.close()
+            return []
 
-        body_text = page.locator("body").inner_text(timeout=15000)
-        date_texts = extract_onebox_dates_from_text(body_text)
+        select_urls = get_onebox_select_urls(page, url)
+        print("DEBUG Onebox select URLs:", select_urls)
 
-        print("DEBUG Onebox playwright fechas:", date_texts)
+        if not select_urls:
+            body_text = page.locator("body").inner_text(timeout=15000)
+            date_texts = extract_onebox_dates_from_text(body_text)
+            print("DEBUG Onebox fechas en página padre:", date_texts)
+        else:
+            date_texts = []
 
-        for raw_date in date_texts:
-            parsed = parse_onebox_date(raw_date)
-            if not parsed:
-                continue
+        for select_url in select_urls:
+            try:
+                page.goto(select_url, wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(5000)
 
-            fecha_iso, hora = parsed
-            key = (fecha_iso, hora)
+                body_text = page.locator("body").inner_text(timeout=15000)
+                current_date_texts = extract_onebox_dates_from_text(body_text)
 
-            if key in seen:
-                continue
+                print("DEBUG Onebox fechas en", select_url, ":", current_date_texts)
 
-            seen.add(key)
+                for raw_date in current_date_texts:
+                    parsed = parse_onebox_date(raw_date)
+                    if not parsed:
+                        continue
 
+                    fecha_iso, hora = parsed
+                    key = (fecha_iso, hora)
+
+                    if key in seen:
+                        continue
+
+                    seen.add(key)
+
+                    stock, capacidad = count_onebox_stock_playwright(page)
+                    vendidas = (
+                        max(0, capacidad - stock)
+                        if stock is not None and capacidad is not None
+                        else None
+                    )
+
+                    fecha_dt = datetime.strptime(fecha_iso, "%Y-%m-%d")
+                    fecha_label = fecha_dt.strftime("%d %b %Y")
+
+                    out.append({
+                        "fecha_label": fecha_label,
+                        "fecha_iso": fecha_iso,
+                        "hora": hora,
+                        "vendidas_dt": vendidas,
+                        "capacidad": capacidad,
+                        "stock": stock,
+                    })
+
+            except Exception as e:
+                print(f"ERROR Onebox select {select_url}: {e}")
+
+        if not select_urls:
             stock, capacidad = count_onebox_stock_playwright(page)
-            vendidas = max(0, capacidad - stock) if stock is not None and capacidad is not None else None
+            vendidas = (
+                max(0, capacidad - stock)
+                if stock is not None and capacidad is not None
+                else None
+            )
 
-            fecha_dt = datetime.strptime(fecha_iso, "%Y-%m-%d")
-            fecha_label = fecha_dt.strftime("%d %b %Y")
+            for raw_date in date_texts:
+                parsed = parse_onebox_date(raw_date)
+                if not parsed:
+                    continue
 
-            out.append({
-                "fecha_label": fecha_label,
-                "fecha_iso": fecha_iso,
-                "hora": hora,
-                "vendidas_dt": vendidas,
-                "capacidad": capacidad,
-                "stock": stock,
-            })
+                fecha_iso, hora = parsed
+                key = (fecha_iso, hora)
+
+                if key in seen:
+                    continue
+
+                seen.add(key)
+
+                fecha_dt = datetime.strptime(fecha_iso, "%Y-%m-%d")
+                fecha_label = fecha_dt.strftime("%d %b %Y")
+
+                out.append({
+                    "fecha_label": fecha_label,
+                    "fecha_iso": fecha_iso,
+                    "hora": hora,
+                    "vendidas_dt": vendidas,
+                    "capacidad": capacidad,
+                    "stock": stock,
+                })
 
         browser.close()
 
     return sorted(out, key=lambda f: (f["fecha_iso"], f.get("hora") or "00:00"))
-
-
-def fetch_functions_onebox(url: str) -> list[dict]:
-    try:
-        funcs = fetch_functions_onebox_requests(url)
-        if funcs:
-            return funcs
-    except Exception as e:
-        print(f"ERROR Onebox requests: {e}")
-
-    try:
-        funcs = fetch_functions_onebox_playwright(url)
-        if funcs:
-            return funcs
-    except Exception as e:
-        print(f"ERROR Onebox Playwright: {e}")
-
-    return []
 
 
 # ================== ABONOTEATRO ================== #
