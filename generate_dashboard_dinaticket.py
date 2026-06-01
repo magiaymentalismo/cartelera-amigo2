@@ -10,7 +10,11 @@ from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+try:
+    from playwright.sync_api import sync_playwright
+except Exception:
+    sync_playwright = None
 
 
 # ===================== CONFIG ===================== #
@@ -43,6 +47,7 @@ TZ = ZoneInfo("Europe/Madrid")
 TEMPLATE_PATH = Path("template.html")
 MANIFEST_PATH = Path("manifest.json")
 SW_PATH = Path("sw.js")
+
 
 MESES = {
     "Ene.": "01", "Ene": "01",
@@ -131,6 +136,19 @@ def write_schedule_json(payload: dict) -> None:
 
 # ================== DINATICKET ================== #
 
+def parse_dinaticket_hour(raw: str) -> str | None:
+    hora_txt = raw.strip().lower()
+    hora_txt = hora_txt.replace(" ", "").replace("h", ":").rstrip(":")
+
+    m = re.match(r"^(\d{1,2})(?::?(\d{2}))?$", hora_txt)
+    if not m:
+        return hora_txt or None
+
+    hh = int(m.group(1))
+    mm = int(m.group(2) or "00")
+    return f"{hh:02d}:{mm:02d}"
+
+
 def fetch_functions_dinaticket(url: str, timeout: int = 20) -> list[dict]:
     r = requests.get(url, headers=UA, timeout=timeout)
     r.raise_for_status()
@@ -172,14 +190,7 @@ def fetch_functions_dinaticket(url: str, timeout: int = 20) -> list[dict]:
         fecha_label = fecha_dt.strftime("%d %b %Y")
 
         hora_span = session.find("span", class_="session-card__time-session")
-        hora_txt = (hora_span.get_text(strip=True) if hora_span else "")
-        hora_txt = hora_txt.lower().replace(" ", "").replace("h", ":")
-
-        m = re.match(r"^(\d{1,2})(?::?(\d{2}))?$", hora_txt)
-        if m:
-            hora = f"{int(m.group(1)):02d}:{int(m.group(2) or '00'):02d}"
-        else:
-            hora = hora_txt or None
+        hora = parse_dinaticket_hour(hora_span.get_text(strip=True) if hora_span else "")
 
         quota = session.find("div", class_="js-quota-row")
         cap = int(quota.get("data-quota-total", 0)) if quota else None
@@ -195,12 +206,13 @@ def fetch_functions_dinaticket(url: str, timeout: int = 20) -> list[dict]:
             "stock": stock,
         })
 
-    return sorted(out, key=lambda f: (f["fecha_iso"], f["hora"] or "00:00"))
+    return sorted(out, key=lambda f: (f["fecha_iso"], f.get("hora") or "00:00"))
 
 
 # ================== ONEBOX / ESCALERA ================== #
 
 def parse_onebox_date(raw: str) -> tuple[str, str] | None:
+    raw = raw.replace("\xa0", " ")
     raw = " ".join(raw.split()).lower()
 
     m = re.search(
@@ -221,19 +233,29 @@ def parse_onebox_date(raw: str) -> tuple[str, str] | None:
         print("DEBUG mes Onebox no reconocido:", repr(mes_txt))
         return None
 
-    return f"{anio}-{mes_num}-{dia.zfill(2)}", f"{int(hh):02d}:{mm}"
+    fecha_iso = f"{anio}-{mes_num}-{dia.zfill(2)}"
+    hora = f"{int(hh):02d}:{mm}"
+    return fecha_iso, hora
 
 
 def extract_onebox_dates_from_text(text: str) -> list[str]:
-    return re.findall(
-        r"(?:LUN|MAR|MI[EÉ]|JUE|VIE|S[AÁ]B|DOM)\.?,?\s+"
-        r"\d{1,2}\s+[a-zA-ZáéíóúÁÉÍÓÚñÑ]+?\s+\d{4}\s*-\s*\d{1,2}:\d{2}",
-        text,
-        flags=re.IGNORECASE,
+    text = text.replace("\xa0", " ")
+    text = " ".join(text.split())
+
+    pattern = re.compile(
+        r"(?:lun|mar|mi[eé]|jue|vie|s[aá]b|dom)\.?,?\s+"
+        r"\d{1,2}\s+"
+        r"(?:ene|feb|mar|abr|may|jun|jul|ago|sep|sept|oct|nov|dic|"
+        r"enero|febrero|marzo|abril|mayo|junio|julio|agosto|"
+        r"septiembre|octubre|noviembre|diciembre)"
+        r"\s+\d{4}\s*-\s*\d{1,2}:\d{2}",
+        re.IGNORECASE,
     )
 
+    return pattern.findall(text)
 
-def count_onebox_stock(page) -> tuple[int | None, int | None]:
+
+def count_onebox_stock_playwright(page) -> tuple[int | None, int | None]:
     available_selectors = [
         "[data-status='available']",
         "[data-state='available']",
@@ -283,56 +305,59 @@ def count_onebox_stock(page) -> tuple[int | None, int | None]:
     return stock, capacidad
 
 
-def try_open_onebox_date_dropdown(page) -> None:
-    selectors = [
-        "text=keyboard_arrow_down",
-        "button:has-text('keyboard_arrow_down')",
-        "[aria-label*='fecha']",
-        "[aria-label*='Fecha']",
-        "[role='button']:has-text('2026')",
-        "div:has-text('2026')",
-    ]
+def fetch_functions_onebox_requests(url: str, timeout: int = 20) -> list[dict]:
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
 
-    for selector in selectors:
-        try:
-            loc = page.locator(selector).first
-            if loc.count():
-                loc.click(timeout=2500)
-                page.wait_for_timeout(1200)
-                return
-        except Exception:
+    r = requests.get(url, headers=UA, timeout=timeout)
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    text = soup.get_text(" ", strip=True)
+
+    date_texts = extract_onebox_dates_from_text(text)
+    print("DEBUG Onebox requests fechas:", date_texts)
+
+    for raw_date in date_texts:
+        parsed = parse_onebox_date(raw_date)
+        if not parsed:
             continue
 
+        fecha_iso, hora = parsed
+        key = (fecha_iso, hora)
 
-def click_onebox_date(page, raw_date: str) -> None:
-    candidates = [
-        f"text={raw_date}",
-        f"*:has-text('{raw_date}')",
-    ]
-
-    for selector in candidates:
-        try:
-            loc = page.locator(selector).first
-            if loc.count():
-                loc.click(timeout=3000)
-                page.wait_for_load_state("networkidle", timeout=8000)
-                page.wait_for_timeout(1200)
-                return
-        except Exception:
+        if key in seen:
             continue
 
+        seen.add(key)
 
-def fetch_functions_onebox(url: str, timeout: int = 45000) -> list[dict]:
+        fecha_dt = datetime.strptime(fecha_iso, "%Y-%m-%d")
+        fecha_label = fecha_dt.strftime("%d %b %Y")
+
+        out.append({
+            "fecha_label": fecha_label,
+            "fecha_iso": fecha_iso,
+            "hora": hora,
+            "vendidas_dt": None,
+            "capacidad": None,
+            "stock": None,
+        })
+
+    return sorted(out, key=lambda f: (f["fecha_iso"], f.get("hora") or "00:00"))
+
+
+def fetch_functions_onebox_playwright(url: str, timeout: int = 45000) -> list[dict]:
+    if sync_playwright is None:
+        print("DEBUG Playwright no está instalado")
+        return []
+
     out: list[dict] = []
     seen: set[tuple[str, str]] = set()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
 
         page = browser.new_page(
@@ -342,26 +367,13 @@ def fetch_functions_onebox(url: str, timeout: int = 45000) -> list[dict]:
             timezone_id="Europe/Madrid",
         )
 
-        try:
-            page.goto(url, wait_until="networkidle", timeout=timeout)
-        except PlaywrightTimeoutError:
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-            page.wait_for_timeout(4000)
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        page.wait_for_timeout(5000)
 
-        try:
-            page.wait_for_selector("body", timeout=10000)
-        except PlaywrightTimeoutError:
-            pass
-
-        try_open_onebox_date_dropdown(page)
-
-        body_text = page.locator("body").inner_text(timeout=timeout)
+        body_text = page.locator("body").inner_text(timeout=15000)
         date_texts = extract_onebox_dates_from_text(body_text)
 
-        if not date_texts:
-            date_texts = extract_onebox_dates_from_text(page.content())
-
-        print("DEBUG Onebox fechas detectadas:", date_texts)
+        print("DEBUG Onebox playwright fechas:", date_texts)
 
         for raw_date in date_texts:
             parsed = parse_onebox_date(raw_date)
@@ -376,13 +388,7 @@ def fetch_functions_onebox(url: str, timeout: int = 45000) -> list[dict]:
 
             seen.add(key)
 
-            try:
-                try_open_onebox_date_dropdown(page)
-                click_onebox_date(page, raw_date)
-            except Exception:
-                pass
-
-            stock, capacidad = count_onebox_stock(page)
+            stock, capacidad = count_onebox_stock_playwright(page)
             vendidas = max(0, capacidad - stock) if stock is not None and capacidad is not None else None
 
             fecha_dt = datetime.strptime(fecha_iso, "%Y-%m-%d")
@@ -399,7 +405,25 @@ def fetch_functions_onebox(url: str, timeout: int = 45000) -> list[dict]:
 
         browser.close()
 
-    return sorted(out, key=lambda f: (f["fecha_iso"], f["hora"] or "00:00"))
+    return sorted(out, key=lambda f: (f["fecha_iso"], f.get("hora") or "00:00"))
+
+
+def fetch_functions_onebox(url: str) -> list[dict]:
+    try:
+        funcs = fetch_functions_onebox_requests(url)
+        if funcs:
+            return funcs
+    except Exception as e:
+        print(f"ERROR Onebox requests: {e}")
+
+    try:
+        funcs = fetch_functions_onebox_playwright(url)
+        if funcs:
+            return funcs
+    except Exception as e:
+        print(f"ERROR Onebox Playwright: {e}")
+
+    return []
 
 
 # ================== ABONOTEATRO ================== #
