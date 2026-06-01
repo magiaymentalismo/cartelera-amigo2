@@ -3,35 +3,45 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
-import shutil
 
 # ===================== CONFIG ===================== #
-EVENTS = {
+
+DINATICKET_EVENTS = {
     "Escondido": "https://www.dinaticket.com/es/provider/20073/event/4919204",
-    "Escalera": "https://www.dinaticket.com/es/provider/10402/event/4923185",
     "Oniria": "https://www.dinaticket.com/es/provider/20073/event/4940326",
+}
+
+ONEBOX_EVENTS = {
+    "Escalera": "https://entradas.laescaleradejacob.es/laescaleradejacob/select/2877829",
 }
 
 FEVER_URLS = {
     "Miedo": "https://feverup.com/m/290561",
     "Disfruta": "https://feverup.com/m/159767",
 }
+
 ABONO_URL = "https://compras.abonoteatro.com/?pagename=espectaculo&eventid=23816"
 
 UA = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X) "
-        "AppleWebKit/537.36 (KHTML, como Gecko) Chrome/123 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
     )
 }
 
-# Dinaticket suele usar abreviaturas tipo "Ene." pero a veces aparece sin punto.
+TZ = ZoneInfo("Europe/Madrid")
+
+TEMPLATE_PATH = Path("template.html")
+MANIFEST_PATH = Path("manifest.json")
+SW_PATH = Path("sw.js")
+
 MESES = {
     "Ene.": "01", "Ene": "01",
     "Feb.": "02", "Feb": "02",
@@ -47,7 +57,6 @@ MESES = {
     "Dic.": "12", "Dic": "12",
 }
 
-# Meses largos que usa AbonoTeatro ("noviembre 2025", etc.)
 MESES_LARGO = {
     "enero": "01",
     "febrero": "02",
@@ -63,15 +72,24 @@ MESES_LARGO = {
     "diciembre": "12",
 }
 
-TZ = ZoneInfo("Europe/Madrid")
+MESES_ES = {
+    "ene": "01", "enero": "01",
+    "feb": "02", "febrero": "02",
+    "mar": "03", "marzo": "03",
+    "abr": "04", "abril": "04",
+    "may": "05", "mayo": "05",
+    "jun": "06", "junio": "06",
+    "jul": "07", "julio": "07",
+    "ago": "08", "agosto": "08",
+    "sep": "09", "sept": "09", "septiembre": "09",
+    "oct": "10", "octubre": "10",
+    "nov": "11", "noviembre": "11",
+    "dic": "12", "diciembre": "12",
+}
 
-# ================== TEMPLATE (HTML) ================== #
-TEMPLATE_PATH = Path("template.html")
-MANIFEST_PATH = Path("manifest.json")
-SW_PATH = Path("sw.js")
 
+# ================== HTML / JSON OUTPUT ================== #
 
-# ================== GENERATE HTML ================== #
 def write_html(payload: dict) -> None:
     if not TEMPLATE_PATH.exists():
         print("❌ Error: No existe template.html")
@@ -99,10 +117,6 @@ def write_html(payload: dict) -> None:
 
 
 def write_schedule_json(payload: dict) -> None:
-    """
-    Exporta el payload completo a docs/schedule.json
-    para que GitHub Pages lo sirva y tu web (Hostinger) lo consuma por fetch.
-    """
     docs_dir = Path("docs")
     docs_dir.mkdir(exist_ok=True)
 
@@ -114,6 +128,7 @@ def write_schedule_json(payload: dict) -> None:
 
 
 # ================== SCRAPER DINATICKET ================== #
+
 def fetch_functions_dinaticket(url: str, timeout: int = 20) -> list[dict]:
     r = requests.get(url, headers=UA, timeout=timeout)
     r.raise_for_status()
@@ -136,12 +151,8 @@ def fetch_functions_dinaticket(url: str, timeout: int = 20) -> list[dict]:
             continue
 
         mes_txt = mes.text.strip()
-        mes_num = MESES.get(mes_txt)
+        mes_num = MESES.get(mes_txt) or MESES.get(mes_txt.replace(".", ""))
         if not mes_num:
-            # fallback: quitar punto y reintentar
-            mes_num = MESES.get(mes_txt.replace(".", ""))
-        if not mes_num:
-            # si no lo reconoce, saltamos (mejor que inventar)
             print("DEBUG mes no reconocido Dinaticket:", repr(mes_txt))
             continue
 
@@ -151,7 +162,6 @@ def fetch_functions_dinaticket(url: str, timeout: int = 20) -> list[dict]:
         fecha_iso_tmp = f"{anio}-{mes_num}-{dia.text.strip().zfill(2)}"
         fecha_dt = datetime.strptime(fecha_iso_tmp, "%Y-%m-%d")
 
-        # Si la fecha ya pasó, asumimos año siguiente
         if fecha_dt.date() < now.date():
             fecha_dt = fecha_dt.replace(year=anio + 1)
 
@@ -159,7 +169,8 @@ def fetch_functions_dinaticket(url: str, timeout: int = 20) -> list[dict]:
         fecha_label = fecha_dt.strftime("%d %b %Y")
 
         hora_span = session.find("span", class_="session-card__time-session")
-        hora_txt = (hora_span.text or "").strip().lower().replace(" ", "").replace("h", ":")
+        hora_txt = (hora_span.text if hora_span else "").strip().lower()
+        hora_txt = hora_txt.replace(" ", "").replace("h", ":")
 
         m = re.match(r"^(\d{1,2})(?::?(\d{2}))?$", hora_txt)
         if m:
@@ -170,12 +181,9 @@ def fetch_functions_dinaticket(url: str, timeout: int = 20) -> list[dict]:
             hora = hora_txt
 
         quota = session.find("div", class_="js-quota-row")
-        if not quota:
-            continue
-
-        cap = int(quota.get("data-quota-total", 0))
-        stock = int(quota.get("data-stock", 0))
-        vendidas = max(0, cap - stock)
+        cap = int(quota.get("data-quota-total", 0)) if quota else None
+        stock = int(quota.get("data-stock", 0)) if quota else None
+        vendidas = max(0, cap - stock) if cap is not None and stock is not None else None
 
         out.append({
             "fecha_label": fecha_label,
@@ -189,7 +197,58 @@ def fetch_functions_dinaticket(url: str, timeout: int = 20) -> list[dict]:
     return out
 
 
+# ================== SCRAPER ONEBOX / ESCALERA ================== #
+
+def fetch_functions_onebox(url: str, timeout: int = 20) -> list[dict]:
+    r = requests.get(url, headers=UA, timeout=timeout)
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    text = soup.get_text(" ", strip=True)
+
+    pattern = re.compile(
+        r"\b(?:lun|mar|mi[eé]|jue|vie|s[aá]b|dom)\.?,?\s+"
+        r"(\d{1,2})\s+([a-záéíóúñ]+)\s+(\d{4})\s*-\s*(\d{1,2}):(\d{2})",
+        re.IGNORECASE,
+    )
+
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    for m in pattern.finditer(text):
+        dia, mes_txt, anio, hh, mm = m.groups()
+        mes_key = mes_txt.lower().replace(".", "")
+        mes_num = MESES_ES.get(mes_key)
+
+        if not mes_num:
+            print("DEBUG mes no reconocido Onebox:", repr(mes_txt))
+            continue
+
+        fecha_iso = f"{anio}-{mes_num}-{dia.zfill(2)}"
+        hora = f"{int(hh):02d}:{mm}"
+
+        key = (fecha_iso, hora)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        fecha_dt = datetime.strptime(fecha_iso, "%Y-%m-%d")
+        fecha_label = fecha_dt.strftime("%d %b %Y")
+
+        out.append({
+            "fecha_label": fecha_label,
+            "fecha_iso": fecha_iso,
+            "hora": hora,
+            "vendidas_dt": None,
+            "capacidad": None,
+            "stock": None,
+        })
+
+    return out
+
+
 # ================== SCRAPER ABONOTEATRO ================== #
+
 def fetch_abonoteatro_shows(url: str, timeout: int = 20) -> set[tuple[str, str]]:
     r = requests.get(url, headers=UA, timeout=timeout)
     r.raise_for_status()
@@ -226,6 +285,7 @@ def fetch_abonoteatro_shows(url: str, timeout: int = 20) -> set[tuple[str, str]]
         dia_tag = fecha_div.find("p", class_="psesb")
         if not dia_tag:
             continue
+
         dia_num = re.sub(r"\D", "", dia_tag.get_text(strip=True)).zfill(2)
 
         hora_h3 = ses.find("h3", class_="horasesion")
@@ -238,24 +298,18 @@ def fetch_abonoteatro_shows(url: str, timeout: int = 20) -> set[tuple[str, str]]
             print("DEBUG hora rara:", repr(hora_txt))
             continue
 
-        hh = m_hora.group(1).zfill(2)
-        mm = m_hora.group(2).zfill(2)
-        hora = f"{hh}:{mm}"
-
+        hora = f"{m_hora.group(1).zfill(2)}:{m_hora.group(2).zfill(2)}"
         fecha_iso = f"{anio}-{mes_num}-{dia_num}"
+
         out.add((fecha_iso, hora))
 
     print("DEBUG AbonoTeatro fechas/hora:", sorted(out))
     return out
 
 
-# ================== FEVER (SIN PLAYWRIGHT) ================== #
+# ================== FEVER ================== #
+
 def fetch_fever_dates(url: str, timeout: int = 15) -> set[str]:
-    """
-    Fever embedda JSON dentro del HTML con un campo:
-        "datesWithSessions": ["2025-12-12", "2025-12-27"]
-    Extraemos solo fechas (sin horas).
-    """
     try:
         r = requests.get(url, headers=UA, timeout=timeout)
         r.raise_for_status()
@@ -273,7 +327,8 @@ def fetch_fever_dates(url: str, timeout: int = 15) -> set[str]:
         return set()
 
 
-# ================== OUTPUT ================== #
+# ================== PAYLOAD ================== #
+
 def build_rows(funcs: list[dict]) -> list[list]:
     return [
         [
@@ -290,19 +345,19 @@ def build_rows(funcs: list[dict]) -> list[list]:
     ]
 
 
-def build_payload(eventos: dict, abono_shows: set[tuple[str, str]]) -> dict:
+def build_payload(eventos: dict[str, list[dict]], abono_shows: set[tuple[str, str]]) -> dict:
     now = datetime.now(TZ)
     out: dict[str, dict] = {}
 
-    abono_fechas = {fecha for (fecha, _hora) in abono_shows}
+    abono_fechas = {fecha for fecha, _hora in abono_shows}
 
     for sala, funcs in eventos.items():
 
-        # ---------- ABONO ----------
         if sala == "Escondido":
             for f in funcs:
                 fecha = f["fecha_iso"]
                 hora = f["hora"]
+
                 if (fecha, hora) in abono_shows:
                     f["abono_estado"] = "venta"
                 elif fecha in abono_fechas:
@@ -313,19 +368,15 @@ def build_payload(eventos: dict, abono_shows: set[tuple[str, str]]) -> dict:
             for f in funcs:
                 f["abono_estado"] = None
 
-        # ---------- FEVER ----------
         if sala in ["Miedo", "Disfruta"]:
             fever_url = FEVER_URLS.get(sala)
-            if fever_url:
-                fever_dates = fetch_fever_dates(fever_url)
-                print(f"DEBUG Fever {sala} fechas:", sorted(fever_dates))
+            fever_dates = fetch_fever_dates(fever_url) if fever_url else set()
 
-                for f in funcs:
-                    fecha = f["fecha_iso"]
-                    f["fever_estado"] = "venta" if fecha in fever_dates else "agotado"
-            else:
-                for f in funcs:
-                    f["fever_estado"] = None
+            print(f"DEBUG Fever {sala} fechas:", sorted(fever_dates))
+
+            for f in funcs:
+                fecha = f["fecha_iso"]
+                f["fever_estado"] = "venta" if fecha in fever_dates else "agotado"
         else:
             for f in funcs:
                 f["fever_estado"] = None
@@ -338,7 +389,10 @@ def build_payload(eventos: dict, abono_shows: set[tuple[str, str]]) -> dict:
             hora_txt = f["hora"] or "00:00"
 
             try:
-                ses_dt = datetime.strptime(f"{fecha_iso} {hora_txt}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+                ses_dt = datetime.strptime(
+                    f"{fecha_iso} {hora_txt}",
+                    "%Y-%m-%d %H:%M"
+                ).replace(tzinfo=TZ)
             except Exception:
                 ses_dt = None
 
@@ -348,21 +402,35 @@ def build_payload(eventos: dict, abono_shows: set[tuple[str, str]]) -> dict:
                 pasadas.append(f)
             else:
                 d = datetime.strptime(fecha_iso, "%Y-%m-%d").date()
-                (proximas if d >= now.date() else pasadas).append(f)
+                if d >= now.date():
+                    proximas.append(f)
+                else:
+                    pasadas.append(f)
 
-        print(f"[DEBUG] {sala}: total={len(funcs)} · proximas={len(proximas)} · pasadas={len(pasadas)}")
+        proximas.sort(key=lambda f: (f["fecha_iso"], f["hora"] or "00:00"))
+
+        print(
+            f"[DEBUG] {sala}: total={len(funcs)} "
+            f"· proximas={len(proximas)} · pasadas={len(pasadas)}"
+        )
 
         if pasadas:
             print(f"[INFO] Eliminando {len(pasadas)} funciones pasadas de {sala}")
 
         out[sala] = {
             "table": {
-                "headers": ["Fecha","Hora","Vendidas","FechaISO","Capacidad","Stock","Abono","Fever"],
+                "headers": [
+                    "Fecha", "Hora", "Vendidas", "FechaISO",
+                    "Capacidad", "Stock", "Abono", "Fever"
+                ],
                 "rows": build_rows(proximas),
             },
             "proximas": {
                 "table": {
-                    "headers": ["Fecha","Hora","Vendidas","FechaISO","Capacidad","Stock","Abono","Fever"],
+                    "headers": [
+                        "Fecha", "Hora", "Vendidas", "FechaISO",
+                        "Capacidad", "Stock", "Abono", "Fever"
+                    ],
                     "rows": build_rows(proximas),
                 }
             },
@@ -376,13 +444,19 @@ def build_payload(eventos: dict, abono_shows: set[tuple[str, str]]) -> dict:
 
 
 # ================== MAIN ================== #
+
 if __name__ == "__main__":
     current: dict[str, list[dict]] = {}
 
-    for sala, url in EVENTS.items():
+    for sala, url in DINATICKET_EVENTS.items():
         funcs = fetch_functions_dinaticket(url)
         current[sala] = funcs
-        print(f"{sala}: {len(funcs)} funciones extraídas")
+        print(f"{sala}: {len(funcs)} funciones Dinaticket extraídas")
+
+    for sala, url in ONEBOX_EVENTS.items():
+        funcs = fetch_functions_onebox(url)
+        current[sala] = funcs
+        print(f"{sala}: {len(funcs)} funciones Onebox extraídas")
 
     try:
         abono_shows = fetch_abonoteatro_shows(ABONO_URL)
@@ -392,5 +466,6 @@ if __name__ == "__main__":
         abono_shows = set()
 
     payload = build_payload(current, abono_shows)
+
     write_html(payload)
     write_schedule_json(payload)
