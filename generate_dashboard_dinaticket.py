@@ -28,6 +28,46 @@ ONEBOX_EVENTS = {
     "Escalera": "https://entradas.laescaleradejacob.es/laescaleradejacob/events/56109",
 }
 
+ONEBOX_FALLBACK_SELECTS = {
+    "https://entradas.laescaleradejacob.es/laescaleradejacob/events/56109": [
+        {
+            "url": "https://entradas.laescaleradejacob.es/laescaleradejacob/select/2877829",
+            "fecha_iso": "2026-06-06",
+            "hora": "23:00",
+        },
+        {
+            "url": "https://entradas.laescaleradejacob.es/laescaleradejacob/select/2877830",
+            "fecha_iso": "2026-06-13",
+            "hora": "23:00",
+        },
+        {
+            "url": "https://entradas.laescaleradejacob.es/laescaleradejacob/select/2889698",
+            "fecha_iso": "2026-06-20",
+            "hora": "23:00",
+        },
+        {
+            "url": "https://entradas.laescaleradejacob.es/laescaleradejacob/select/2904421",
+            "fecha_iso": "2026-06-07",
+            "hora": "21:00",
+        },
+        {
+            "url": "https://entradas.laescaleradejacob.es/laescaleradejacob/select/2904422",
+            "fecha_iso": "2026-06-14",
+            "hora": "21:00",
+        },
+        {
+            "url": "https://entradas.laescaleradejacob.es/laescaleradejacob/select/2904423",
+            "fecha_iso": "2026-06-21",
+            "hora": "21:00",
+        },
+        {
+            "url": "https://entradas.laescaleradejacob.es/laescaleradejacob/select/2904452",
+            "fecha_iso": "2026-06-19",
+            "hora": "20:00",
+        },
+    ],
+}
+
 FEVER_URLS = {
     "Miedo": "https://feverup.com/m/290561",
     "Disfruta": "https://feverup.com/m/159767",
@@ -47,6 +87,8 @@ TZ = ZoneInfo("Europe/Madrid")
 TEMPLATE_PATH = Path("template.html")
 MANIFEST_PATH = Path("manifest.json")
 SW_PATH = Path("sw.js")
+DOCS_DIR = Path("docs")
+ONEBOX_CACHE_PATH = DOCS_DIR / "onebox_cache.json"
 
 
 MESES = {
@@ -95,6 +137,50 @@ MESES_ES = {
 }
 
 
+# ================== HELPERS ================== #
+
+def safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def normalize_hhmm(h: str | None) -> str:
+    if not h:
+        return "00:00"
+
+    s = str(h).strip().lower()
+    s = s.replace(" ", "").replace("h", "")
+    s = re.sub(r"[^0-9:]", "", s)
+    s = s.rstrip(":")
+
+    m = re.match(r"^(\d{1,2})(?::?(\d{2}))?$", s)
+    if not m:
+        return s
+
+    return f"{int(m.group(1)):02d}:{int(m.group(2) or '00'):02d}"
+
+
+def load_onebox_cache() -> dict:
+    if not ONEBOX_CACHE_PATH.exists():
+        return {}
+
+    try:
+        return json.loads(ONEBOX_CACHE_PATH.read_text("utf-8"))
+    except Exception:
+        return {}
+
+
+def save_onebox_cache(cache: dict) -> None:
+    DOCS_DIR.mkdir(exist_ok=True)
+    ONEBOX_CACHE_PATH.write_text(
+        json.dumps(cache, ensure_ascii=False, indent=2),
+        "utf-8",
+    )
+    print("✔ Actualizado docs/onebox_cache.json")
+
+
 # ================== OUTPUT ================== #
 
 def write_html(payload: dict) -> None:
@@ -108,29 +194,28 @@ def write_html(payload: dict) -> None:
         json.dumps(payload, ensure_ascii=False).replace("</script>", "<\\/script>")
     )
 
-    docs_dir = Path("docs")
-    docs_dir.mkdir(exist_ok=True)
+    DOCS_DIR.mkdir(exist_ok=True)
 
-    (docs_dir / "index.html").write_text(html, "utf-8")
+    (DOCS_DIR / "index.html").write_text(html, "utf-8")
     print("✔ Generado docs/index.html")
 
     if MANIFEST_PATH.exists():
-        shutil.copy(MANIFEST_PATH, docs_dir / "manifest.json")
+        shutil.copy(MANIFEST_PATH, DOCS_DIR / "manifest.json")
         print("✔ Copiado manifest.json")
 
     if SW_PATH.exists():
-        shutil.copy(SW_PATH, docs_dir / "sw.js")
+        shutil.copy(SW_PATH, DOCS_DIR / "sw.js")
         print("✔ Copiado sw.js")
 
 
 def write_schedule_json(payload: dict) -> None:
-    docs_dir = Path("docs")
-    docs_dir.mkdir(exist_ok=True)
+    DOCS_DIR.mkdir(exist_ok=True)
 
-    (docs_dir / "schedule.json").write_text(
+    (DOCS_DIR / "schedule.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         "utf-8",
     )
+
     print("✔ Generado docs/schedule.json")
 
 
@@ -192,10 +277,16 @@ def fetch_functions_dinaticket(url: str, timeout: int = 20) -> list[dict]:
         hora_span = session.find("span", class_="session-card__time-session")
         hora = parse_dinaticket_hour(hora_span.get_text(strip=True) if hora_span else "")
 
-        quota = session.find("div", class_="js-quota-row")
-        cap = int(quota.get("data-quota-total", 0)) if quota else None
-        stock = int(quota.get("data-stock", 0)) if quota else None
-        vendidas = max(0, cap - stock) if cap is not None and stock is not None else None
+        quotas = session.find_all("div", class_="js-quota-row")
+
+        if not quotas:
+            cap = None
+            stock = None
+            vendidas = None
+        else:
+            cap = sum(safe_int(q.get("data-quota-total", 0)) for q in quotas)
+            stock = sum(safe_int(q.get("data-stock", 0)) for q in quotas)
+            vendidas = max(0, cap - stock)
 
         out.append({
             "fecha_label": fecha_label,
@@ -258,13 +349,13 @@ def extract_onebox_dates_from_text(text: str) -> list[str]:
 
 def count_onebox_stock_playwright(page) -> tuple[int | None, int | None]:
     available_selectors = [
+        ".seat.available",
+        ".available",
+        ".is-available",
         "[data-status='available']",
         "[data-state='available']",
         "[data-seat-status='available']",
         "[data-availability='available']",
-        ".available",
-        ".is-available",
-        ".seat.available",
         "button:not([disabled])[aria-label*='Asiento']",
         "button:not([disabled])[aria-label*='Butaca']",
         "button:not([disabled])[aria-label*='Seat']",
@@ -272,10 +363,10 @@ def count_onebox_stock_playwright(page) -> tuple[int | None, int | None]:
     ]
 
     total_selectors = [
+        ".seat",
         "[data-seat-id]",
         "[data-place-id]",
         "[data-seat]",
-        ".seat",
         "button[aria-label*='Asiento']",
         "button[aria-label*='Butaca']",
         "button[aria-label*='Seat']",
@@ -306,17 +397,48 @@ def count_onebox_stock_playwright(page) -> tuple[int | None, int | None]:
     return stock, capacidad
 
 
-def get_onebox_select_urls(page, parent_url: str) -> list[str]:
+def get_onebox_select_urls(page, parent_url: str) -> list[dict]:
+    fallback = ONEBOX_FALLBACK_SELECTS.get(parent_url, [])
+    fallback_by_url = {
+        item["url"]: item
+        for item in fallback
+        if isinstance(item, dict) and item.get("url")
+    }
+
     if "/select/" in parent_url:
-        return [parent_url]
+        return [{"url": parent_url}]
 
-    hrefs = page.eval_on_selector_all(
-        "a[href]",
-        """els => els.map(a => a.href).filter(h => h.includes('/select/'))"""
-    )
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
 
-    select_urls = sorted(set(hrefs))
-    return select_urls
+    select_urls: list[str] = []
+
+    for delay in [3000, 6000, 9000]:
+        page.wait_for_timeout(delay)
+
+        try:
+            hrefs = page.eval_on_selector_all(
+                "a[href]",
+                """els => els.map(a => a.href).filter(h => h.includes('/select/'))"""
+            )
+        except Exception:
+            hrefs = []
+
+        select_urls = sorted(set(select_urls + hrefs))
+
+        if select_urls:
+            break
+
+    if not select_urls and fallback:
+        print(f"⚠️ Onebox sin enlaces dinámicos; usando fallback: {len(fallback)} URLs")
+        return fallback
+
+    return [
+        fallback_by_url.get(url, {"url": url})
+        for url in select_urls
+    ]
 
 
 def fetch_functions_onebox(url: str) -> list[dict]:
@@ -326,6 +448,8 @@ def fetch_functions_onebox(url: str) -> list[dict]:
 
     out: list[dict] = []
     seen: set[tuple[str, str]] = set()
+    cache = load_onebox_cache()
+    cache_changed = False
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -342,87 +466,76 @@ def fetch_functions_onebox(url: str) -> list[dict]:
 
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(5000)
         except Exception as e:
             print(f"ERROR Onebox página padre: {e}")
             browser.close()
             return []
 
-        select_urls = get_onebox_select_urls(page, url)
-        print("DEBUG Onebox select URLs:", select_urls)
+        select_items = get_onebox_select_urls(page, url)
+        print("DEBUG Onebox select URLs:", select_items)
 
-        if not select_urls:
-            body_text = page.locator("body").inner_text(timeout=15000)
-            date_texts = extract_onebox_dates_from_text(body_text)
-            print("DEBUG Onebox fechas en página padre:", date_texts)
-        else:
-            date_texts = []
+        for select_item in select_items:
+            select_url = select_item["url"]
 
-        for select_url in select_urls:
             try:
                 page.goto(select_url, wait_until="domcontentloaded", timeout=45000)
-                page.wait_for_timeout(5000)
+
+                try:
+                    page.wait_for_selector(".seat, .available", timeout=15000)
+                except Exception:
+                    page.wait_for_timeout(5000)
 
                 body_text = page.locator("body").inner_text(timeout=15000)
                 current_date_texts = extract_onebox_dates_from_text(body_text)
 
-                print("DEBUG Onebox fechas en", select_url, ":", current_date_texts)
-
-                for raw_date in current_date_texts:
-                    parsed = parse_onebox_date(raw_date)
+                if current_date_texts:
+                    parsed = parse_onebox_date(current_date_texts[0])
                     if not parsed:
+                        print(f"DEBUG Onebox fecha no parseable: {current_date_texts[0]}")
                         continue
 
                     fecha_iso, hora = parsed
-                    key = (fecha_iso, hora)
+                else:
+                    fecha_iso = select_item.get("fecha_iso")
+                    hora = select_item.get("hora")
 
-                    if key in seen:
+                    if not fecha_iso or not hora:
+                        print(f"DEBUG Onebox sin fecha visible y sin fallback: {select_url}")
                         continue
 
-                    seen.add(key)
-
-                    stock, capacidad = count_onebox_stock_playwright(page)
-                    vendidas = (
-                        max(0, capacidad - stock)
-                        if stock is not None and capacidad is not None
-                        else None
-                    )
-
-                    fecha_dt = datetime.strptime(fecha_iso, "%Y-%m-%d")
-                    fecha_label = fecha_dt.strftime("%d %b %Y")
-
-                    out.append({
-                        "fecha_label": fecha_label,
-                        "fecha_iso": fecha_iso,
-                        "hora": hora,
-                        "vendidas_dt": vendidas,
-                        "capacidad": capacidad,
-                        "stock": stock,
-                    })
-
-            except Exception as e:
-                print(f"ERROR Onebox select {select_url}: {e}")
-
-        if not select_urls:
-            stock, capacidad = count_onebox_stock_playwright(page)
-            vendidas = (
-                max(0, capacidad - stock)
-                if stock is not None and capacidad is not None
-                else None
-            )
-
-            for raw_date in date_texts:
-                parsed = parse_onebox_date(raw_date)
-                if not parsed:
-                    continue
-
-                fecha_iso, hora = parsed
                 key = (fecha_iso, hora)
 
                 if key in seen:
                     continue
 
                 seen.add(key)
+
+                stock, capacidad = count_onebox_stock_playwright(page)
+                cache_key = f"{fecha_iso}|{hora}|{select_url}"
+
+                if stock is not None and capacidad is not None:
+                    vendidas = max(0, capacidad - stock)
+                    cache[cache_key] = {
+                        "stock": stock,
+                        "capacidad": capacidad,
+                        "vendidas_dt": vendidas,
+                        "updated_at": datetime.now(TZ).isoformat(),
+                    }
+                    cache_changed = True
+                else:
+                    old = cache.get(cache_key)
+
+                    if old:
+                        stock = old.get("stock")
+                        capacidad = old.get("capacidad")
+                        vendidas = old.get("vendidas_dt")
+                        print(
+                            f"↩ Usando cache Onebox para {fecha_iso} {hora}: "
+                            f"stock={stock}, cap={capacidad}"
+                        )
+                    else:
+                        vendidas = None
+                        print(f"⚠️ Sin stock Onebox ni cache para {fecha_iso} {hora}")
 
                 fecha_dt = datetime.strptime(fecha_iso, "%Y-%m-%d")
                 fecha_label = fecha_dt.strftime("%d %b %Y")
@@ -436,7 +549,13 @@ def fetch_functions_onebox(url: str) -> list[dict]:
                     "stock": stock,
                 })
 
+            except Exception as e:
+                print(f"ERROR Onebox select {select_url}: {e}")
+
         browser.close()
+
+    if cache_changed:
+        save_onebox_cache(cache)
 
     return sorted(out, key=lambda f: (f["fecha_iso"], f.get("hora") or "00:00"))
 
